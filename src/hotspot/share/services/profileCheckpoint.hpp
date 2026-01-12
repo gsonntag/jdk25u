@@ -10,6 +10,7 @@ class fileStream;
 class ProfileCheckpoint {
 public:
     // Binary format (File = [HEADER][SYMTAB][CLASSES][RECORDS])
+    //
     // HEADER:
     //   magic[4] = 'M','D','O','X'
     //   pointer_size: u16 (e.g., 8)
@@ -23,16 +24,20 @@ public:
     //   [u32 len][len bytes utf8]
     //
     // CLASSES: repeated class_count times:
-    //   [u1 loader_id][u4 klass_sym_id]
+    //   [u1 loader_id][u4 loader_name_sym_id][u4 klass_sym_id]
+    //   (loader_name_sym_id is 0xFFFFFFFF if loader != NAMED)
     // 
     // RECORD: repeated rec_count times
-    //   klass_id:u32, name_id:u32, sig_id:u32, loader:u8, comp_level:u8, mdo_size:u32,
-    //   fixup_count:u32, Fixup[fixup_count], [mdo_size bytes], header_size:u32, [header bytes], mc_size:u32, [mc bytes]
+    //   klass_id:u32, name_id:u32, sig_id:u32, loader:u8, loader_name_id:u32, comp_level:u8,
+    //   mdo_size:u32, fixup_count:u32, Fixup[fixup_count], [mdo_size bytes],
+    //   header_size:u32, [header bytes], mc_size:u32, [mc bytes]
     //
     // Fixup: repeated fixup_count times
-    //   [u4 offset_in_mdo][u4 target_sym_id][u1 loader_id]
+    //   [u4 offset_in_mdo][u4 target_sym_id][u1 loader_id][u4 loader_name_sym_id]
 
-  enum class LoaderId : u1 { BOOT, PLATFORM, SYSTEM, UNDEFINED, HIDDEN };
+  // LoaderId values: BOOT=0, PLATFORM=1, SYSTEM=2, UNDEFINED=3, HIDDEN=4, NAMED=5
+  // NAMED is used for user-defined loaders with a stable name (ClassLoader.getName())
+  enum class LoaderId : u1 { BOOT, PLATFORM, SYSTEM, UNDEFINED, HIDDEN, NAMED };
 
   struct SymbolId { uint32_t id; };
 
@@ -40,6 +45,7 @@ public:
     uint32_t offset_in_mdo;
     SymbolId  target;
     LoaderId  loader;
+    SymbolId  loader_name;  // valid only if loader == NAMED; 0xFFFFFFFF otherwise
   };
 
   struct ByteRange { uint64_t off; uint32_t size; };
@@ -56,6 +62,7 @@ public:
 
   struct MethodKey {
     LoaderId  loader;
+    SymbolId  loader_name;  // valid only if loader == NAMED; 0xFFFFFFFF otherwise
     SymbolId  klass; // "a/b/C"
     SymbolId  name;  // "foo"
     SymbolId  sig;   // "(I)Ljava/lang/String;"
@@ -92,6 +99,7 @@ public:
 
   struct Class {
     LoaderId loader;
+    SymbolId loader_name;  // valid only if loader == NAMED; 0xFFFFFFFF otherwise
     SymbolId klass;
   };
 

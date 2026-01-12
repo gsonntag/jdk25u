@@ -17,6 +17,7 @@
 #include "runtime/os.hpp"
 #include "runtime/globals.hpp"
 #include "runtime/deoptimization.hpp"
+#include "runtime/mutexLocker.hpp"
 #include "compiler/compilationPolicy.hpp"
 #include "compiler/compileBroker.hpp"
 #include "compiler/compilerDefinitions.hpp"
@@ -140,18 +141,27 @@ static bool read_symtab(FILE* in, GrowableArray<char*>& symbols, u4 expected) {
 }
 
 static bool write_classes(fileStream* out, const GrowableArray<ProfileCheckpoint::Class>& classes) {
+  // MDOX format: [u1 loader_id][u4 loader_name_sym_id][u4 klass_sym_id]
+  const u4 NO_LOADER_NAME = 0xFFFFFFFF;
   for (int i = 0; i < classes.length(); i++) {
     const ProfileCheckpoint::Class& c = classes.at(i);
     if (!write_u1(out, (u1)c.loader)) return false;
+    u4 loader_name_id = (c.loader == ProfileCheckpoint::LoaderId::NAMED) ? c.loader_name.id : NO_LOADER_NAME;
+    if (!write_u4(out, loader_name_id)) return false;
     if (!write_u4(out, c.klass.id)) return false;
   }
   return true;
 }
 
 static bool read_classes(FILE* in, GrowableArray<ProfileCheckpoint::Class>& classes, u4 expected) {
+  const u4 NO_LOADER_NAME = 0xFFFFFFFF;
   for (u4 ci = 0; ci < expected; ci++) {
     u1 loader_raw = 0;
     if (!read_u1(in, loader_raw)) {
+      return false;
+    }
+    u4 loader_name_id = NO_LOADER_NAME;
+    if (!read_u4(in, loader_name_id)) {
       return false;
     }
     u4 klass_id = 0;
@@ -160,6 +170,7 @@ static bool read_classes(FILE* in, GrowableArray<ProfileCheckpoint::Class>& clas
     }
     ProfileCheckpoint::Class c;
     c.loader = (ProfileCheckpoint::LoaderId)loader_raw;
+    c.loader_name.id = loader_name_id;
     c.klass.id = klass_id;
     classes.append(c);
   }
@@ -167,11 +178,15 @@ static bool read_classes(FILE* in, GrowableArray<ProfileCheckpoint::Class>& clas
 }
 
 static bool write_record(fileStream* out, const ProfileCheckpoint::Record& r, const void* mdo_bytes, const ProfileCheckpoint::Fixup* fixups, const void* mc_bytes, const void* header_bytes) {
+  const u4 NO_LOADER_NAME = 0xFFFFFFFF;
   if (!write_u4(out, r.key.klass.id)) return false;
   if (!write_u4(out, r.key.name.id))  return false;
   if (!write_u4(out, r.key.sig.id))   return false;
   u1 loader = (u1)r.key.loader;
   if (!write_exact(out, &loader, sizeof(loader))) return false;
+  // MDOX: write loader_name_id after loader
+  u4 loader_name_id = (r.key.loader == ProfileCheckpoint::LoaderId::NAMED) ? r.key.loader_name.id : NO_LOADER_NAME;
+  if (!write_u4(out, loader_name_id)) return false;
   if (!write_exact(out, &r.comp_level, sizeof(r.comp_level))) return false;
   if (!write_u4(out, r.mdo_size)) return false;
   if (!write_u4(out, r.fixup_count)) return false;
@@ -180,6 +195,9 @@ static bool write_record(fileStream* out, const ProfileCheckpoint::Record& r, co
     if (!write_u4(out, fixups[i].target.id)) return false;
     u1 fx_loader = (u1)fixups[i].loader;
     if (!write_u1(out, fx_loader)) return false;
+    // MDOX: write fixup loader_name_id
+    u4 fx_loader_name_id = (fixups[i].loader == ProfileCheckpoint::LoaderId::NAMED) ? fixups[i].loader_name.id : NO_LOADER_NAME;
+    if (!write_u4(out, fx_loader_name_id)) return false;
   }
   if (!write_exact(out, mdo_bytes, r.mdo_size)) return false;
   if (!write_u4(out, r.header_size)) return false;
@@ -194,12 +212,15 @@ static bool write_record(fileStream* out, const ProfileCheckpoint::Record& r, co
 }
 
 static bool read_record(FILE* in, ProfileCheckpoint::Record& r, ProfileCheckpoint::Fixup*& fixups, char*& mdo_bytes, char*& mc_bytes, char*& header_bytes) {
+  const u4 NO_LOADER_NAME = 0xFFFFFFFF;
   if (!read_u4(in, r.key.klass.id)) return false;
   if (!read_u4(in, r.key.name.id))  return false;
   if (!read_u4(in, r.key.sig.id))   return false;
   u1 loader = 0;
   if (!read_exact(in, &loader, sizeof(loader))) return false;
   r.key.loader = (ProfileCheckpoint::LoaderId)loader;
+  r.key.loader_name.id = NO_LOADER_NAME;
+  if (!read_u4(in, r.key.loader_name.id)) return false;
   if (!read_exact(in, &r.comp_level, sizeof(r.comp_level))) return false;
   if (!read_u4(in, r.mdo_size)) return false;
   if (!read_u4(in, r.fixup_count)) return false;
@@ -213,6 +234,8 @@ static bool read_record(FILE* in, ProfileCheckpoint::Record& r, ProfileCheckpoin
       u1 fx_loader = 0;
       if (!read_u1(in, fx_loader)) { os::free(fixups); return false; }
       fixups[i].loader = (ProfileCheckpoint::LoaderId)fx_loader;
+      fixups[i].loader_name.id = NO_LOADER_NAME;
+      if (!read_u4(in, fixups[i].loader_name.id)) { os::free(fixups); return false; }
     }
   }
   mdo_bytes = nullptr;
@@ -323,6 +346,18 @@ static void print_mdo_header(MethodData* mdo, outputStream* st = tty) {
 // ============================================================================
 // Symbolic resolution helpers (LoaderId / klass / method)
 // ============================================================================
+
+// Get the stable loader name for a non-built-in, non-hidden class loader.
+// Returns nullptr if the loader doesn't have an explicit name set.
+// Caller needs ResourceMark.
+static const char* get_loader_name_for_klass(InstanceKlass* ik) {
+  if (ik == nullptr || ik->is_hidden()) return nullptr;
+  ClassLoaderData* cld = ik->class_loader_data();
+  if (cld == nullptr || cld->is_builtin_class_loader_data()) return nullptr;
+  // Use loader_name() which returns the explicit name or class name
+  return cld->loader_name();
+}
+
 static ProfileCheckpoint::LoaderId loader_id_from_klass(InstanceKlass* ik) {
   if (ik != nullptr && ik->is_hidden()) {
     return ProfileCheckpoint::LoaderId::HIDDEN;
@@ -331,15 +366,68 @@ static ProfileCheckpoint::LoaderId loader_id_from_klass(InstanceKlass* ik) {
   if (cld == nullptr || cld->is_boot_class_loader_data()) return ProfileCheckpoint::LoaderId::BOOT;
   if (cld->is_platform_class_loader_data()) return ProfileCheckpoint::LoaderId::PLATFORM;
   if (cld->is_system_class_loader_data()) return ProfileCheckpoint::LoaderId::SYSTEM;
+  // Non-built-in loader: use NAMED if we can get a name
   log_debug(compilation)("Non-builtin loader encountered: %s", cld->loader_name_and_id());
-  return ProfileCheckpoint::LoaderId::UNDEFINED;
+  return ProfileCheckpoint::LoaderId::NAMED;
 }
 
-static Handle loader_handle_from_loader(ProfileCheckpoint::LoaderId loader_id, TRAPS) {
+// Look up a user-defined class loader by its name.
+// Returns a Handle to the loader oop if found, or null Handle if not found or multiple matches.
+static Handle loader_handle_by_name(const char* loader_name, TRAPS) {
+  if (loader_name == nullptr) return Handle();
+
+  oop candidate = nullptr;
+  int candidate_count = 0;
+
+  {
+    MutexLocker ml(ClassLoaderDataGraph_lock, Mutex::_no_safepoint_check_flag);
+
+    class FindLoaderByName : public CLDClosure {
+      const char* _name;
+      oop* _candidate;
+      int* _count;
+     public:
+      FindLoaderByName(const char* name, oop* candidate, int* count)
+        : _name(name), _candidate(candidate), _count(count) {}
+      void do_cld(ClassLoaderData* cld) override {
+        if (cld == nullptr) return;
+        if (cld->is_builtin_class_loader_data()) return;
+        // Skip CLDs dedicated to non-strong hidden classes.
+        if (cld->has_class_mirror_holder()) return;
+        oop loader = cld->class_loader_no_keepalive();
+        if (loader == nullptr) return;
+        // Compare loader name
+        const char* cld_name = cld->loader_name();
+        if (cld_name != nullptr && strcmp(cld_name, _name) == 0) {
+          (*_count)++;
+          if (*_candidate == nullptr) {
+            *_candidate = loader;
+          }
+        }
+      }
+    } finder(loader_name, &candidate, &candidate_count);
+
+    ClassLoaderDataGraph::loaded_cld_do(&finder);
+  }
+
+  log_debug(compilation)("loader_handle_by_name('%s'): found %d matches", loader_name, candidate_count);
+  if (candidate_count == 1 && candidate != nullptr) {
+    return Handle(THREAD, candidate);
+  }
+  if (candidate_count > 1) {
+    log_debug(compilation)("loader_handle_by_name('%s'): multiple loaders with same name, failing closed", loader_name);
+  }
+  return Handle();
+}
+
+// Get a Handle to the class loader for resolution.
+// For NAMED loaders, uses the loader_name to look up the loader.
+static Handle loader_handle_from_loader(ProfileCheckpoint::LoaderId loader_id, const char* loader_name, TRAPS) {
   switch (loader_id) {
     case ProfileCheckpoint::LoaderId::BOOT: return Handle();
     case ProfileCheckpoint::LoaderId::PLATFORM: return Handle(THREAD, SystemDictionary::java_platform_loader());
     case ProfileCheckpoint::LoaderId::SYSTEM: return Handle(THREAD, SystemDictionary::java_system_loader());
+    case ProfileCheckpoint::LoaderId::NAMED: return loader_handle_by_name(loader_name, THREAD);
     default: return Handle();
   }
 }
@@ -358,14 +446,14 @@ static const char* get_klassname_utf8(InstanceKlass* ik) {
   return ik->name()->as_utf8();
 }
 
-static InstanceKlass* resolve_klass_utf8(const char* name, ProfileCheckpoint::LoaderId loader_id, TRAPS) {
+static InstanceKlass* resolve_klass_utf8(const char* name, ProfileCheckpoint::LoaderId loader_id, const char* loader_name, TRAPS) {
   if (name != nullptr && name[0] == '@') {
     log_debug(compilation)("resolving %s", name);
     InstanceKlass* hk = DynoLocatorScan::resolve_locator(name, THREAD);
     if (hk != nullptr) return hk;
   }
   Symbol* sym = SymbolTable::new_symbol(name);
-  Handle loader = loader_handle_from_loader(loader_id, THREAD);
+  Handle loader = loader_handle_from_loader(loader_id, loader_name, THREAD);
   Klass* k = SystemDictionary::resolve_or_fail(sym, loader, true, THREAD);
   if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; return nullptr; }
   return (k != nullptr && k->is_instance_klass()) ? InstanceKlass::cast(k) : nullptr;
@@ -435,6 +523,21 @@ static void sanitize_type_entries(MethodData* mdo) {
 static void collect_type_fixups(MethodData* mdo,
                                 ProfileCheckpoint::SymtabBuilder& stb,
                                 GrowableArray<ProfileCheckpoint::Fixup>& out_fixups) {
+  // Helper lambda to create a fixup with loader_name properly set
+  auto make_fixup = [&stb](InstanceKlass* ik, u4 offset) -> ProfileCheckpoint::Fixup {
+    ProfileCheckpoint::Fixup fx;
+    fx.offset_in_mdo = offset;
+    fx.target.id = stb.intern(get_klassname_utf8(ik));
+    fx.loader = loader_id_from_klass(ik);
+    if (fx.loader == ProfileCheckpoint::LoaderId::NAMED) {
+      const char* lname = get_loader_name_for_klass(ik);
+      fx.loader_name.id = (lname != nullptr) ? stb.intern(lname) : 0xFFFFFFFF;
+    } else {
+      fx.loader_name.id = 0xFFFFFFFF;
+    }
+    return fx;
+  };
+
   for (ProfileData* pd = mdo->first_data(); mdo->is_valid(pd); pd = mdo->next_data(pd)) {
     if (pd->is_VirtualCallData() || pd->is_ReceiverTypeData()) {
       ReceiverTypeData* rtd = pd->as_ReceiverTypeData();
@@ -444,12 +547,7 @@ static void collect_type_fixups(MethodData* mdo,
         Klass* k = TypeEntries::valid_klass(*cell);
         if (k != nullptr && k->is_instance_klass()) {
           InstanceKlass* ik = InstanceKlass::cast(k);
-          const char* cname = get_klassname_utf8(ik);
-          ProfileCheckpoint::Fixup fx;
-          fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
-          fx.target.id = stb.intern(cname);
-          fx.loader = loader_id_from_klass(ik);
-          out_fixups.append(fx);
+          out_fixups.append(make_fixup(ik, (u4)((pd->dp() + off_b) - (address)mdo)));
         }
       }
     }
@@ -462,12 +560,7 @@ static void collect_type_fixups(MethodData* mdo,
           Klass* k = TypeEntries::valid_klass(*cell);
           if (k != nullptr && k->is_instance_klass()) {
             InstanceKlass* ik = InstanceKlass::cast(k);
-            const char* cname = get_klassname_utf8(ik);
-            ProfileCheckpoint::Fixup fx;
-            fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
-            fx.target.id = stb.intern(cname);
-            fx.loader = loader_id_from_klass(ik);
-            out_fixups.append(fx);
+            out_fixups.append(make_fixup(ik, (u4)((pd->dp() + off_b) - (address)mdo)));
           }
         }
       }
@@ -477,12 +570,7 @@ static void collect_type_fixups(MethodData* mdo,
         Klass* k = TypeEntries::valid_klass(*cell);
         if (k != nullptr && k->is_instance_klass()) {
           InstanceKlass* ik = InstanceKlass::cast(k);
-          const char* cname = get_klassname_utf8(ik);
-          ProfileCheckpoint::Fixup fx;
-          fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
-          fx.target.id = stb.intern(cname);
-          fx.loader = loader_id_from_klass(ik);
-          out_fixups.append(fx);
+          out_fixups.append(make_fixup(ik, (u4)((pd->dp() + off_b) - (address)mdo)));
         }
       }
     }
@@ -495,12 +583,7 @@ static void collect_type_fixups(MethodData* mdo,
           Klass* k = TypeEntries::valid_klass(*cell);
           if (k != nullptr && k->is_instance_klass()) {
             InstanceKlass* ik = InstanceKlass::cast(k);
-            const char* cname = get_klassname_utf8(ik);
-            ProfileCheckpoint::Fixup fx;
-            fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
-            fx.target.id = stb.intern(cname);
-            fx.loader = loader_id_from_klass(ik);
-            out_fixups.append(fx);
+            out_fixups.append(make_fixup(ik, (u4)((pd->dp() + off_b) - (address)mdo)));
           }
         }
       }
@@ -510,12 +593,7 @@ static void collect_type_fixups(MethodData* mdo,
         Klass* k = TypeEntries::valid_klass(*cell);
         if (k != nullptr && k->is_instance_klass()) {
           InstanceKlass* ik = InstanceKlass::cast(k);
-          const char* cname = get_klassname_utf8(ik);
-          ProfileCheckpoint::Fixup fx;
-          fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
-          fx.target.id = stb.intern(cname);
-          fx.loader = loader_id_from_klass(ik);
-          out_fixups.append(fx);
+          out_fixups.append(make_fixup(ik, (u4)((pd->dp() + off_b) - (address)mdo)));
         }
       }
     }
@@ -528,12 +606,7 @@ static void collect_type_fixups(MethodData* mdo,
       Klass* k = TypeEntries::valid_klass(*cell);
       if (k != nullptr && k->is_instance_klass()) {
         InstanceKlass* ik = InstanceKlass::cast(k);
-        const char* cname = get_klassname_utf8(ik);
-        ProfileCheckpoint::Fixup fx;
-        fx.offset_in_mdo = (u4)((p_dp + off_b) - (address)mdo);
-        fx.target.id = stb.intern(cname);
-        fx.loader = loader_id_from_klass(ik);
-        out_fixups.append(fx);
+        out_fixups.append(make_fixup(ik, (u4)((p_dp + off_b) - (address)mdo)));
       }
     }
   }
@@ -552,7 +625,14 @@ static void apply_fixups(MethodData* mdo,
       continue;
     }
     const char* cname = symtab.at((int)fx.target.id);
-    InstanceKlass* k = resolve_klass_utf8(cname, fx.loader, THREAD);
+    // Get loader name from symtab if it's a NAMED loader
+    const char* loader_name = nullptr;
+    if (fx.loader == ProfileCheckpoint::LoaderId::NAMED && fx.loader_name.id != 0xFFFFFFFF) {
+      if ((int)fx.loader_name.id >= 0 && (int)fx.loader_name.id < symtab.length()) {
+        loader_name = symtab.at((int)fx.loader_name.id);
+      }
+    }
+    InstanceKlass* k = resolve_klass_utf8(cname, fx.loader, loader_name, THREAD);
     if (k != nullptr) {
       address cell_addr = (address)mdo + fx.offset_in_mdo;
       intptr_t* cell = (intptr_t*)cell_addr;
@@ -707,8 +787,15 @@ bool ProfileCheckpoint::Loader::install_record(const Record& rec,
   const char* kname = symtab.at((int)rec.key.klass.id);
   const char* mname = symtab.at((int)rec.key.name.id);
   const char* msig  = symtab.at((int)rec.key.sig.id);
+  // Get loader name from symtab if it's a NAMED loader
+  const char* loader_name = nullptr;
+  if (rec.key.loader == LoaderId::NAMED && rec.key.loader_name.id != 0xFFFFFFFF) {
+    if ((int)rec.key.loader_name.id >= 0 && (int)rec.key.loader_name.id < symtab.length()) {
+      loader_name = symtab.at((int)rec.key.loader_name.id);
+    }
+  }
 
-  InstanceKlass* holder = resolve_klass_utf8(kname, rec.key.loader, THREAD);
+  InstanceKlass* holder = resolve_klass_utf8(kname, rec.key.loader, loader_name, THREAD);
   if (holder == nullptr) {
     log_debug(compilation)("MDO checkpoint: resolve class failed for %s", kname);
     return false;
@@ -863,7 +950,14 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
       continue;
     }
     const char* cname = symtab.at((int)cls.klass.id);
-    InstanceKlass* holder = resolve_klass_utf8(cname, cls.loader, THREAD);
+    // Get loader name from symtab if it's a NAMED loader
+    const char* loader_name = nullptr;
+    if (cls.loader == LoaderId::NAMED && cls.loader_name.id != 0xFFFFFFFF) {
+      if ((int)cls.loader_name.id >= 0 && (int)cls.loader_name.id < symtab.length()) {
+        loader_name = symtab.at((int)cls.loader_name.id);
+      }
+    }
+    InstanceKlass* holder = resolve_klass_utf8(cname, cls.loader, loader_name, THREAD);
     if (holder != nullptr) {
       holder->link_class(THREAD);
       if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
@@ -968,6 +1062,13 @@ public:
     InstanceKlass* ik = InstanceKlass::cast(k);
     ProfileCheckpoint::Class c;
     c.loader = loader_id_from_klass(ik);
+    // For NAMED loaders, intern the loader name
+    if (c.loader == ProfileCheckpoint::LoaderId::NAMED) {
+      const char* lname = get_loader_name_for_klass(ik);
+      c.loader_name.id = (lname != nullptr) ? _stb->intern(lname) : 0xFFFFFFFF;
+    } else {
+      c.loader_name.id = 0xFFFFFFFF;
+    }
     c.klass.id = _stb->intern(get_klassname_utf8(ik));
     _classes->append(c);
   }
@@ -1077,6 +1178,13 @@ void ProfileCheckpoint::dump_to_stream(fileStream* out) {
       stb.intern(rec_metas.at(ri).kname);
       stb.intern(rec_metas.at(ri).mname);
       stb.intern(rec_metas.at(ri).sig);
+      // Also intern loader names for NAMED loaders
+      Method* m = methods_with_mdo.at(ri);
+      LoaderId lid = loader_id_from_klass(m->method_holder());
+      if (lid == LoaderId::NAMED) {
+        const char* lname = get_loader_name_for_klass(m->method_holder());
+        if (lname != nullptr) stb.intern(lname);
+      }
     }
     stb.freeze();
 
@@ -1095,6 +1203,13 @@ void ProfileCheckpoint::dump_to_stream(fileStream* out) {
       Record rec;
 
       rec.key.loader = loader_id_from_klass(m->method_holder());
+      // For NAMED loaders, set loader_name
+      if (rec.key.loader == ProfileCheckpoint::LoaderId::NAMED) {
+        const char* lname = get_loader_name_for_klass(m->method_holder());
+        rec.key.loader_name.id = (lname != nullptr) ? stb.id_of(lname) : 0xFFFFFFFF;
+      } else {
+        rec.key.loader_name.id = 0xFFFFFFFF;
+      }
       rec.key.klass.id = stb.id_of(rec_meta.kname);
       rec.key.name.id  = stb.id_of(rec_meta.mname);
       rec.key.sig.id   = stb.id_of(rec_meta.sig);
